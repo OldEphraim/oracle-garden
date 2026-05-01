@@ -1,0 +1,9 @@
+# docker-compose.yml — Oracle Garden
+#
+# Placeholder. Populated incrementally per STEPS.md:
+#   - Phase 1:  postgres service for local DB + migrations.
+#   - Phase 17: api and web services for the full local stack
+#               (multi-stage Go build, Next.js standalone output,
+#                healthcheck-gated depends_on, env from .env).
+#
+# Until Phase 1, this file intentionally declares no services.
