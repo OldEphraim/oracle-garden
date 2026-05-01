@@ -1,0 +1,30 @@
+# Env
+.env
+.env.local
+*.env
+
+# Go
+/api/bin/
+*.test
+*.out
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.log
+npm-debug.log*
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Build artifacts
+dist/
+build/
+
+# Local data
+/tmp/
+*.db
