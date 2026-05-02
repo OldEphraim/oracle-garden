@@ -1,6 +1,6 @@
-# AGENT_TEMPLATES.md — Oracle Garden Built-in Agent Templates
+# AGENT_TEMPLATES.md — Sibyl Hub Built-in Agent Templates
 
-Companion to CLAUDE.md. Source of truth for the v0 system agent templates: their I/O contracts, tool requirements, and system prompt sketches. As Oracle Garden grows, new system templates are added here; user-built templates live in the `agent_templates` table with `is_system = false`.
+Companion to CLAUDE.md. Source of truth for the v0 system agent templates: their I/O contracts, tool requirements, and system prompt sketches. As Sibyl Hub grows, new system templates are added here; user-built templates live in the `agent_templates` table with `is_system = false`.
 
 This file pairs with TYPES.md (which specifies the schemas these agents emit and consume) and with CLAUDE.md's Workflow Execution Engine section (which specifies how these agents are wired together).
 

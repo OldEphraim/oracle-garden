@@ -1,4 +1,4 @@
-# DATABASE_SCHEMA.md — Oracle Garden Database Schema
+# DATABASE_SCHEMA.md — Sibyl Hub Database Schema
 
 Companion to CLAUDE.md. Source of truth for all database tables.
 

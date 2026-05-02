@@ -1,4 +1,4 @@
-# STEPS.md — Oracle Garden Build Plan
+# STEPS.md — Sibyl Hub Build Plan
 
 This file is the phased build plan. Each phase has a clear goal, the files it touches, the verification step, and a manual-checkpoint pause for Alan to validate before the next phase begins.
 
@@ -23,7 +23,7 @@ After each phase, append an entry to `DECISION_LOG.md` summarizing decisions mad
 3. Verify `ANTHROPIC_API_KEY` and `NEXTAUTH_SECRET` env vars are set (or note they must be added to `.env` before Phase 4 and Phase 9 respectively). Generate `NEXTAUTH_SECRET` with `openssl rand -base64 32`.
 4. Create the project skeleton:
    ```
-   oracle-garden/
+   sibyl-hub/
    ├── api/
    ├── web/
    ├── docker-compose.yml          (placeholder — populated in Phase 1)
@@ -38,7 +38,7 @@ After each phase, append an entry to `DECISION_LOG.md` summarizing decisions mad
    │                                Decision Log section)
    └── README.md                    (stub — populated in Phase 16)
    ```
-5. Initialize git, set the remote to `git@github.com:OldEphraim/oracle-garden.git` once the repo exists. Do not push until Phase 1 completes.
+5. Initialize git, set the remote to `git@github.com:OldEphraim/sibyl-hub.git` once the repo exists. Do not push until Phase 1 completes.
 
 6. **Confirm exact Anthropic model strings** by checking current Anthropic API documentation. Resolve whether agent template defaults should use the alias forms (`claude-sonnet-4-6`, `claude-haiku-4-5`, `claude-opus-4-7`) or dated suffix forms (e.g., `claude-haiku-4-5-20251001`). Record the chosen strings in `DECISION_LOG.md` so they're consistent across the agent seed JSON, the migration default, and `pricing.go` written in Phase 4.
 
@@ -311,7 +311,7 @@ After each phase, append an entry to `DECISION_LOG.md` summarizing decisions mad
 - `web/app/(app)/agents/page.tsx` — list (System / Mine / Forked).
 - `web/app/(app)/agents/[id]/page.tsx` — view and edit own agents.
 - `web/app/(app)/agents/new/page.tsx` — agent builder form.
-- `web/components/agents/AgentForm.tsx` — name, description, system prompt textarea (monospace), model dropdown (sonnet-4-6, haiku-4-5, opus-4-7), temperature slider, max_tokens, output_type dropdown (with schema preview side panel), input_types multi-select, tools multi-select.
+- `web/components/agents/AgentForm.tsx` — name, description, system prompt textarea (monospace), model dropdown (sonnet-4-6, haiku-4-5, opus-4-7), temperature slider, max_tokens, output_type dropdown (with schema preview side panel), input_types multi-select, tools multi-select. When the user selects Opus 4.7 in the model dropdown, surface a small inline note that effective token consumption is up to 35% higher than other models for the same task, so the daily cost cap may be reached faster.
 - `web/components/agents/SchemaPreview.tsx` — pretty-prints a JSON Schema with field descriptions; uses AJV for the live "validate sample input" panel.
 - `web/lib/schemas.ts` — fetches and caches type registry from `/api/types`. AJV-compiled validators are cached in-memory.
 
@@ -489,4 +489,4 @@ This is **the Phase 6 risk**: the engine has fan-in, fan-out, branching, loops, 
 - Phases 14–14.5: half a day (seeds + reliability iteration may take longer if prompts need work).
 - Phases 15–17: half a day.
 
-**Total: 1 to 1.5 weeks at a comfortable pace.** Plan accordingly. If anything gets blocked or boring, recalibrate rather than push through — Oracle Garden has no external deadline, so optimizing for "does this still feel good to work on tomorrow" is the right move.
+**Total: 1 to 1.5 weeks at a comfortable pace.** Plan accordingly. If anything gets blocked or boring, recalibrate rather than push through — Sibyl Hub has no external deadline, so optimizing for "does this still feel good to work on tomorrow" is the right move.

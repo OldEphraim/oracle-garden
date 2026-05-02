@@ -1,4 +1,4 @@
-# CLAUDE.md — Oracle Garden
+# CLAUDE.md — Sibyl Hub
 
 This file is the architectural source of truth. Three companion files extract dense reference material that is likely to grow or be referenced independently:
 
@@ -12,11 +12,13 @@ When CLAUDE.md and STEPS.md disagree, CLAUDE.md wins. When CLAUDE.md and TYPES.m
 
 ## Project Context
 
-Oracle Garden is a platform where users build trading strategies for prediction markets out of composable AI agents. Each strategy is a workflow on a visual canvas; each node is an agent with a typed input and output schema; agents pass structured data to each other; the terminal node of any strategy emits a `trading_decision.v1` that the platform records as a paper trade.
+Sibyl Hub is a platform where users build trading strategies for prediction markets out of composable AI agents. Each strategy is a workflow on a visual canvas; each node is an agent with a typed input and output schema; agents pass structured data to each other; the terminal node of any strategy emits a `trading_decision.v1` that the platform records as a paper trade.
 
 The conceptual frame is "GitHub for agent workflows," with prediction-market trading as the v0 domain. Workflows and agents both have owners, visibility settings, and fork lineage from day one — even though the v0 UI shows none of that. The marketplace/social layer is a v2 concern; the data model needs to be ready for it.
 
-The name comes from the metaphor that **a single garden can contain many oracles**, each cultivated by its keeper, each speaking with its own voice. Disagreement among oracles is a feature, not a bug — the platform earns its keep by helping users find which oracles speak truer than others, on which markets, under which conditions.
+The name comes from the metaphor that **each agent is a sibyl** — a prophetess delivering oracular advice — and the platform is the **hub** where many sibyls live and operate. Each sibyl has her own voice, cultivated by her keeper; disagreement among sibyls is a feature, not a bug — the platform earns its keep by helping users find which sibyls speak truer than others, on which markets, under which conditions.
+
+Workflows remain "workflows" — we considered "consultations" and decided against, because a sibyl's workflow can take independent action (a paper trade), not just report back. The terminal `trading_decision.v1` may be referred to as a *responsum* in code-comment flavor, but UI text says "response" or "trading decision" plainly.
 
 For v0 we ship: auth, Polymarket-only integration (read-only), 5 built-in agent templates, an agent builder, a workflow builder with branching and loops, a typed schema system with versioning, scheduled execution, paper trading, a monitoring UI, and cost-protection guardrails. We do **not** ship: real-money trading, backtesting, price/event triggers, the social UI, custom tool wiring per user-built agent, deployment to production, Kalshi integration, or news-source customization.
 
@@ -33,7 +35,7 @@ If that flow works smoothly end-to-end, v0 is shipped.
 Single monorepo:
 
 ```
-oracle-garden/
+sibyl-hub/
 ├── api/                        # Go backend
 │   ├── cmd/server/main.go      # Entry point
 │   ├── internal/

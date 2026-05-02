@@ -1,9 +1,31 @@
-# docker-compose.yml — Oracle Garden
+# docker-compose.yml — Sibyl Hub
 #
-# Placeholder. Populated incrementally per STEPS.md:
-#   - Phase 1:  postgres service for local DB + migrations.
-#   - Phase 17: api and web services for the full local stack
-#               (multi-stage Go build, Next.js standalone output,
-#                healthcheck-gated depends_on, env from .env).
-#
-# Until Phase 1, this file intentionally declares no services.
+# Phase 1: postgres only — used by `make migrate-up`, the test repo layer,
+# and any local backend run before Phase 17. The api and web services are
+# added in Phase 17 (multi-stage Go build, Next.js standalone output,
+# healthcheck-gated depends_on, env from .env).
+
+# Pin the Compose project name so volumes/networks are named sibyl-hub_*
+# regardless of the local checkout directory.
+name: sibyl-hub
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sibyl-hub-postgres
+    environment:
+      POSTGRES_USER: sibyl
+      POSTGRES_PASSWORD: sibyl
+      POSTGRES_DB: sibyl_hub
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sibyl -d sibyl_hub"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:

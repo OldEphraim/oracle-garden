@@ -1,4 +1,4 @@
-# TYPES.md — Oracle Garden Type System
+# TYPES.md — Sibyl Hub Type System
 
 Companion to CLAUDE.md. Source of truth for all type schemas, validation rules, and runtime semantics around typed agent I/O.
 
