@@ -187,6 +187,18 @@ type ErrUnknownType struct {
 
 func (e *ErrUnknownType) Error() string { return fmt.Sprintf("types: unknown type %q", e.TypeID) }
 
+// NewRegistryForTest builds a Registry from a pre-built map of definitions.
+// Test-only — production code should use Load(ctx, q). Exported (rather than
+// internal-test-helper) because the runtime package's tests need an in-memory
+// registry without round-tripping through the DB.
+func NewRegistryForTest(defs map[string]*Definition) *Registry {
+	cp := make(map[string]*Definition, len(defs))
+	for k, v := range defs {
+		cp[k] = v
+	}
+	return &Registry{all: cp}
+}
+
 // sortDefinitionsByID is split out so it can be tested in isolation if the
 // stable order ever becomes load-bearing.
 func sortDefinitionsByID(defs []*Definition) {
