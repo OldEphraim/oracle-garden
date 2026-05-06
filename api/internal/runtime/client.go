@@ -1,15 +1,18 @@
 // Package runtime is the agent runtime. client.go is the hand-rolled
 // Anthropic Messages API client; agent.go is the per-step Invoke flow that
 // composes the prompt, calls this client, and validates the structured
-// output. Phase 5 will extend the inner generation loop to handle tool_use
-// blocks; the validation+retry wrapper stays untouched.
+// output.
 //
-// Why hand-rolled instead of the official `anthropic-sdk-go`:
-// see DECISION_LOG.md Phase 4. Short version — our needs are POST /v1/messages
-// with text-in / text-out + Phase-5 tool_use blocks, and the SDK's surface
-// area (streaming, batches, vision, files, MCP, …) is much larger than that.
-// A ~150-line client is simpler to keep correct than tracking what the SDK
-// pins.
+// Phase 4 used a string-typed Message.Content (text-only). Phase 5 widens
+// Content to []ContentBlock so the conversation can carry tool_use and
+// tool_result blocks across rounds — this is what enables agent tool use
+// without rewriting the message model.
+//
+// Why hand-rolled instead of `anthropic-sdk-go`: see DECISION_LOG.md
+// Phase 4. Short version — our needs (POST /v1/messages with text + tool
+// blocks, no streaming, no batches, no vision) are a small slice of the
+// SDK's surface, and managing structs we own is simpler than tracking
+// SDK pins.
 package runtime
 
 import (
@@ -26,7 +29,7 @@ import (
 const (
 	anthropicBaseURL    = "https://api.anthropic.com"
 	anthropicAPIVersion = "2023-06-01"
-	defaultHTTPTimeout  = 120 * time.Second // Anthropic requests can take ~30s on long completions; 90s is the per-step engine cap, but the HTTP client itself stays slack.
+	defaultHTTPTimeout  = 120 * time.Second // Anthropic requests can take ~30s on long completions; the per-step engine cap is 90s.
 )
 
 // AnthropicClient wraps POST /v1/messages. Safe for concurrent use.
@@ -41,11 +44,11 @@ type AnthropicClient struct {
 // AnthropicOptions configures NewAnthropicClient. Zero values fall back to
 // sensible defaults; pass BaseURL to point tests at httptest servers.
 type AnthropicOptions struct {
-	APIKey     string        // required
-	BaseURL    string        // default: https://api.anthropic.com
-	APIVersion string        // default: 2023-06-01
-	HTTPClient *http.Client  // default: &http.Client{Timeout: 120s}
-	Logger     *slog.Logger  // default: slog.Default()
+	APIKey     string       // required
+	BaseURL    string       // default: https://api.anthropic.com
+	APIVersion string       // default: 2023-06-01
+	HTTPClient *http.Client // default: &http.Client{Timeout: 120s}
+	Logger     *slog.Logger // default: slog.Default()
 }
 
 func NewAnthropicClient(opts AnthropicOptions) (*AnthropicClient, error) {
@@ -74,27 +77,94 @@ func NewAnthropicClient(opts AnthropicOptions) (*AnthropicClient, error) {
 	return c, nil
 }
 
-// MessagesRequest mirrors the request body of POST /v1/messages. Only fields
-// we use in v0 are exposed; streaming, batching, vision attachments, and
-// thinking tokens are not part of v0 (see CLAUDE.md "Out of Scope").
+// MessagesRequest mirrors the request body of POST /v1/messages.
 type MessagesRequest struct {
-	Model       string    `json:"model"`
-	MaxTokens   int       `json:"max_tokens"`
-	Temperature *float64  `json:"temperature,omitempty"`
-	System      string    `json:"system,omitempty"`
-	Messages    []Message `json:"messages"`
+	Model       string           `json:"model"`
+	MaxTokens   int              `json:"max_tokens"`
+	Temperature *float64         `json:"temperature,omitempty"`
+	System      string           `json:"system,omitempty"`
+	Messages    []Message        `json:"messages"`
+	Tools       []ToolDefinition `json:"tools,omitempty"` // empty for non-tool-using agents
 }
 
-// Message is one turn in the conversation. v0 keeps content as a string
-// (text-only). Phase 5 will switch to []ContentBlock when tool_use lands.
+// Message is one turn in the conversation. Content is always an array of
+// blocks (the API accepts both a string and an array; we standardize on the
+// array form so v0 and v1+ paths share one shape).
 type Message struct {
-	Role    string `json:"role"`    // "user" | "assistant"
-	Content string `json:"content"` // text-only in v0
+	Role    string         `json:"role"` // "user" | "assistant"
+	Content []ContentBlock `json:"content"`
 }
 
-// MessagesResponse mirrors the response body. Content is a slice of blocks
-// even in v0 (the API always returns it that way), but for text-only calls
-// we only ever look at content[0].text.
+// ContentBlock represents one entry in a message's `content` array. Anthropic
+// uses different keys per block type; we model them all on one struct with
+// `omitempty` everywhere so the on-the-wire JSON only carries the fields
+// relevant to each Type.
+//
+// Block types we use in v0 + v1:
+//
+//   - "text"        — plain assistant or user text
+//     uses: Text
+//   - "tool_use"    — assistant requests a tool invocation
+//     uses: ID, Name, Input
+//   - "tool_result" — caller (us) returns the tool's result to the model
+//     uses: ToolUseID, ResultText, IsError
+//
+// (Server-side tools like web_search produce additional block types at
+// runtime — `web_search_tool_result`, `server_tool_use` — that we surface
+// transparently; the runtime doesn't dispatch them locally.)
+type ContentBlock struct {
+	Type string `json:"type"`
+
+	// type=text
+	Text string `json:"text,omitempty"`
+
+	// type=tool_use (assistant emits these)
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+
+	// type=tool_result (we send these back to the model)
+	ToolUseID  string `json:"tool_use_id,omitempty"`
+	ResultText string `json:"content,omitempty"` // wire field is `content`
+	IsError    bool   `json:"is_error,omitempty"`
+}
+
+// TextBlock is a constructor for the common single-text-block case.
+func TextBlock(s string) ContentBlock {
+	return ContentBlock{Type: "text", Text: s}
+}
+
+// ToolResultBlock builds the user-side reply to an assistant's tool_use
+// block. resultText should be the JSON-stringified output (or an error
+// message when isError is true).
+func ToolResultBlock(toolUseID, resultText string, isError bool) ContentBlock {
+	return ContentBlock{
+		Type:       "tool_result",
+		ToolUseID:  toolUseID,
+		ResultText: resultText,
+		IsError:    isError,
+	}
+}
+
+// ToolDefinition is one element of MessagesRequest.Tools. Two flavors:
+//
+//   - Local tool: Type empty; Name + InputSchema describe a function the
+//     client (us) implements. Anthropic returns tool_use blocks asking us
+//     to call it.
+//   - Server-side tool: Type set (e.g. "web_search_20250305"); Anthropic
+//     handles execution itself and the response carries the result inline.
+//     Name is still required (e.g. "web_search").
+type ToolDefinition struct {
+	Type        string          `json:"type,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	// Server-side-tool-specific knobs (e.g. web_search MaxUses) can be
+	// added here as omitempty fields when we adopt them.
+	MaxUses int `json:"max_uses,omitempty"`
+}
+
+// MessagesResponse mirrors the response body.
 type MessagesResponse struct {
 	ID         string         `json:"id"`
 	Type       string         `json:"type"`
@@ -105,23 +175,14 @@ type MessagesResponse struct {
 	Usage      Usage          `json:"usage"`
 }
 
-// ContentBlock is one entry in `content[]`. For Phase 4 we only encounter
-// `type="text"`; Phase 5 adds `tool_use` and tool-result variants.
-type ContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
-}
-
-// Usage carries the token counts. Anthropic's Messages API uses these field
-// names verbatim — input_tokens / output_tokens (some Anthropic surfaces
-// use prompt_tokens / completion_tokens, but Messages API does not).
+// Usage carries the token counts. Messages API uses input_tokens / output_tokens
+// (NOT prompt_tokens / completion_tokens — that naming is in older surfaces).
 type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 }
 
 // AnthropicError mirrors the error envelope returned on non-2xx responses.
-// Useful for callers that want to branch on `error.type` (e.g. "rate_limit_error").
 type AnthropicError struct {
 	StatusCode int
 	Type       string `json:"type"`
@@ -165,7 +226,6 @@ func (c *AnthropicClient) Messages(ctx context.Context, req MessagesRequest) (*M
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		ae := &AnthropicError{StatusCode: httpResp.StatusCode}
-		// Best-effort error decode; if the body isn't JSON, surface the raw bytes.
 		if jerr := json.Unmarshal(respBody, ae); jerr != nil {
 			ae.Err.Message = string(respBody)
 		}

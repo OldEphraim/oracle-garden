@@ -32,7 +32,7 @@ func quietRuntime(t *testing.T, server *httptest.Server, typeID, schemaJSON stri
 		t.Fatalf("NewAnthropicClient: %v", err)
 	}
 	reg := buildRegistry(t, typeID, schemaJSON)
-	return NewRuntime(c, reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewRuntime(c, reg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // buildRegistry assembles a *types.Registry from an in-memory map. Avoids
@@ -259,9 +259,26 @@ func TestInvokeBothAttemptsFail(t *testing.T) {
 }
 
 func TestInvokeUnknownModelLogsWARNAndZeroCost(t *testing.T) {
-	srv, _ := fakeAnthropic(t, []string{
-		`{"market_slug":"x","direction":"YES","confidence":0.5,"reasoning":"r"}`,
-	})
+	// Server echoes back a model name not in the pricing table — mirrors the
+	// live behavior where Anthropic resolves an unknown alias and returns a
+	// dated form we don't yet know about. After the Phase 5 fix, billing
+	// uses response.model (not request.model), so this is the case that
+	// exercises the WARN-and-zero-cost path.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]any{
+			"id":          "msg_unknown",
+			"type":        "message",
+			"role":        "assistant",
+			"model":       "claude-fake-9-9-20260101", // not in pricing.go
+			"stop_reason": "end_turn",
+			"content": []map[string]any{
+				{"type": "text", "text": `{"market_slug":"x","direction":"YES","confidence":0.5,"reasoning":"r"}`},
+			},
+			"usage": map[string]int{"input_tokens": 100, "output_tokens": 50},
+		}
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(body)
+	}))
 	defer srv.Close()
 	rt := quietRuntime(t, srv, "thesis.v1", thesisV1Schema)
 
@@ -276,6 +293,9 @@ func TestInvokeUnknownModelLogsWARNAndZeroCost(t *testing.T) {
 	}
 	if res.PromptTokens != 100 {
 		t.Errorf("tokens still recorded: got %d", res.PromptTokens)
+	}
+	if res.Model != "claude-fake-9-9-20260101" {
+		t.Errorf("response model: got %q, want claude-fake-9-9-20260101", res.Model)
 	}
 }
 
@@ -364,6 +384,18 @@ func TestStripJSONFences(t *testing.T) {
 		{`{"a":1}`, `{"a":1}`},
 		{"```json\n{\"a\":1}", `{"a":1}`},
 		{"  ```json\n{\"a\":1}\n```  ", `{"a":1}`},
+		// Prose preamble — model says "Now I'll..." then the JSON. The
+		// brace-walking extractor handles this without a retry round.
+		{`Now I'll provide the observation. {"a":1}`, `{"a":1}`},
+		// Balanced braces inside string values must not confuse the walker.
+		{`pre {"a":"with } and { inside","b":1} post`, `{"a":"with } and { inside","b":1}`},
+		// Nested objects.
+		{`prose {"outer":{"inner":2},"x":1}`, `{"outer":{"inner":2},"x":1}`},
+		// Escaped quote inside a string — must not flip in/out of string mode mid-pair.
+		{`prose {"a":"\"escaped\"","b":2}`, `{"a":"\"escaped\"","b":2}`},
+		// No object at all — return the trimmed text as-is so the JSON
+		// parser produces a useful error.
+		{`just some prose`, `just some prose`},
 	}
 	for _, c := range cases {
 		if got := stripJSONFences(c.in); got != c.want {

@@ -24,7 +24,35 @@ type Agent struct {
 	MaxTokens    int
 	SystemPrompt string
 	OutputType   string // typeID, e.g. "thesis.v1" — must be registered
-	// Tools is reserved for Phase 5 (tool_use blocks). v0 ignores it.
+
+	// Tools is the list of internal tool names this agent may call (e.g.
+	// ["polymarket.gamma_get_market", "web_search"]). The runtime resolves
+	// each name through its ToolRegistry; unknown names error at Invoke.
+	// v0: agents pick from the fixed registered set; user-built tools are
+	// a v2 concern.
+	Tools []string
+}
+
+// ToolDispatcher is the runtime's view of the tools registry. Defined as an
+// interface so the runtime package doesn't import internal/tools (tools
+// already imports runtime for the ToolDefinition type — keeps the dependency
+// graph one-way).
+type ToolDispatcher interface {
+	// DefinitionsFor returns the wire-level tool definitions the runtime
+	// passes to Anthropic in MessagesRequest.Tools.
+	DefinitionsFor(internalNames []string) ([]ToolDefinition, error)
+
+	// LookupByAPIName resolves the tool Anthropic named in a tool_use
+	// block. The bool flags an unknown name (registry miss).
+	LookupByAPIName(apiName string) (DispatchableTool, bool)
+}
+
+// DispatchableTool is the tool-side surface the runtime needs at dispatch
+// time. Mirrors tools.Tool but lives here so the runtime stays decoupled.
+type DispatchableTool interface {
+	Name() string
+	IsServerSide() bool
+	Invoke(ctx context.Context, input json.RawMessage) (json.RawMessage, error)
 }
 
 // InvokeResult is the structured outcome of one agent step. On final failure,
@@ -42,17 +70,19 @@ type InvokeResult struct {
 	StopReason       string
 }
 
-// Runtime composes the Anthropic client with the type registry. Build one at
-// startup and reuse it.
+// Runtime composes the Anthropic client with the type registry and (when
+// agents declare tools) a tool dispatcher. Build one at startup and reuse it.
 type Runtime struct {
 	anthropic *AnthropicClient
 	types     *types.Registry
+	tools     ToolDispatcher
 	logger    *slog.Logger
 }
 
-// NewRuntime wires together the dependencies. Logger may be nil (defaults
-// to slog.Default()).
-func NewRuntime(client *AnthropicClient, registry *types.Registry, logger *slog.Logger) *Runtime {
+// NewRuntime wires together the dependencies. tools may be nil for runtimes
+// that only ever drive tool-less agents (e.g., the Phase 4 Thesis Builder
+// driver in agentctl). Logger may be nil (defaults to slog.Default()).
+func NewRuntime(client *AnthropicClient, registry *types.Registry, tools ToolDispatcher, logger *slog.Logger) *Runtime {
 	if client == nil {
 		panic("runtime: NewRuntime: nil AnthropicClient")
 	}
@@ -62,7 +92,7 @@ func NewRuntime(client *AnthropicClient, registry *types.Registry, logger *slog.
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Runtime{anthropic: client, types: registry, logger: logger}
+	return &Runtime{anthropic: client, types: registry, tools: tools, logger: logger}
 }
 
 // Invoke runs one agent step end-to-end:
@@ -113,7 +143,7 @@ func (r *Runtime) Invoke(ctx context.Context, agent Agent, mergedInputs map[stri
 			// upstream. (Polymarket-style retry on 429 lives in client.go's
 			// transport in Phase 5+ if we add it; for now we let the engine
 			// timeout govern.)
-			return finishResult(result, agent.Model, start), fmt.Errorf("runtime: Invoke: anthropic: %w", err)
+			return finishResult(result, result.Model, start), fmt.Errorf("runtime: Invoke: anthropic: %w", err)
 		}
 
 		text = stripJSONFences(text)
@@ -131,11 +161,11 @@ func (r *Runtime) Invoke(ctx context.Context, agent Agent, mergedInputs map[stri
 			// ValidateAgainst returns a non-nil err only on infrastructure
 			// problems (typeID unknown, JSON-not-object after parse). Don't
 			// retry — this is our bug, not the model's.
-			return finishResult(result, agent.Model, start), fmt.Errorf("runtime: validate: %w", verr)
+			return finishResult(result, result.Model, start), fmt.Errorf("runtime: validate: %w", verr)
 		}
 		if len(errs) == 0 {
 			result.Output = parsed
-			return finishResult(result, agent.Model, start), nil
+			return finishResult(result, result.Model, start), nil
 		}
 		// Validation errors — fold into a compact retry note.
 		lastRawText = text
@@ -146,35 +176,157 @@ func (r *Runtime) Invoke(ctx context.Context, agent Agent, mergedInputs map[stri
 	}
 
 	// Both attempts failed.
-	return finishResult(result, agent.Model, start),
+	return finishResult(result, result.Model, start),
 		fmt.Errorf("runtime: agent %q failed validation after %d attempts: %s",
 			agent.Name, maxAttempts, lastErrSummary)
 }
 
-// generateOnce is the inner per-attempt API call. v0 makes a single
-// Messages.New call. Phase 5 will replace the body of this function with a
-// tool-dispatch loop (call → if tool_use blocks: dispatch, append tool_results,
-// call again; cap at 6 rounds; final assistant text is what we return).
-// The validation+retry loop in Invoke stays untouched.
+// MaxToolRounds is the per-step cap on tool-dispatch rounds. CLAUDE.md:
+// "Cap at 6 tool-use rounds per step." A round = one Anthropic API call;
+// after the 6th call the runtime gives up if a tool_use is still pending.
+const MaxToolRounds = 6
+
+// generateOnce is the inner per-attempt API call wrapped by Invoke's
+// validation + retry loop. v0 makes a single round when the agent declares
+// no tools; v0+tools loops up to MaxToolRounds, dispatching local tool_use
+// blocks and feeding tool_result blocks back in until the model returns a
+// non-tool stop_reason (typically "end_turn") OR the cap is reached.
+//
+// Server-side tools (e.g. web_search) are handled by Anthropic itself —
+// they appear in the response inline as `server_tool_use` /
+// `web_search_tool_result` blocks alongside text, with stop_reason="end_turn".
+// They never trigger a tool_use round here.
+//
+// Returns the final assistant text + accumulated usage across all rounds.
+// On API error, accumulated usage up to the failure is returned with a
+// non-nil err.
 func (r *Runtime) generateOnce(
 	ctx context.Context,
 	agent Agent,
 	systemPrompt, userMessage string,
 ) (text string, usage Usage, model string, stopReason string, err error) {
-	temperature := float64(agent.Temperature)
-	resp, err := r.anthropic.Messages(ctx, MessagesRequest{
-		Model:       agent.Model,
-		MaxTokens:   agent.MaxTokens,
-		Temperature: &temperature,
-		System:      systemPrompt,
-		Messages: []Message{
-			{Role: "user", Content: userMessage},
-		},
-	})
-	if err != nil {
-		return "", Usage{}, "", "", err
+	// Resolve the agent's declared tool list to wire-level tool definitions.
+	var toolDefs []ToolDefinition
+	if len(agent.Tools) > 0 {
+		if r.tools == nil {
+			return "", Usage{}, "", "", fmt.Errorf("runtime: agent declares %d tool(s) but runtime has no ToolDispatcher", len(agent.Tools))
+		}
+		toolDefs, err = r.tools.DefinitionsFor(agent.Tools)
+		if err != nil {
+			return "", Usage{}, "", "", fmt.Errorf("runtime: resolve tools: %w", err)
+		}
 	}
-	return extractText(resp), resp.Usage, resp.Model, resp.StopReason, nil
+
+	temperature := float64(agent.Temperature)
+	messages := []Message{
+		{Role: "user", Content: []ContentBlock{TextBlock(userMessage)}},
+	}
+
+	var totalUsage Usage
+	var resp *MessagesResponse
+
+	for round := 1; round <= MaxToolRounds; round++ {
+		resp, err = r.anthropic.Messages(ctx, MessagesRequest{
+			Model:       agent.Model,
+			MaxTokens:   agent.MaxTokens,
+			Temperature: &temperature,
+			System:      systemPrompt,
+			Messages:    messages,
+			Tools:       toolDefs,
+		})
+		if err != nil {
+			return "", totalUsage, "", "", err
+		}
+		totalUsage.InputTokens += resp.Usage.InputTokens
+		totalUsage.OutputTokens += resp.Usage.OutputTokens
+
+		// Find local tool_use blocks. Non-"tool_use" stop reasons OR a
+		// missing tool_use block both mean we're at the final response.
+		toolUseBlocks := collectToolUseBlocks(resp.Content)
+		if resp.StopReason != "tool_use" || len(toolUseBlocks) == 0 {
+			if resp.StopReason == "tool_use" && len(toolUseBlocks) == 0 {
+				r.logger.Warn("runtime: stop_reason=tool_use with no tool_use blocks — treating as final",
+					"agent", agent.Name, "round", round)
+			}
+			return extractText(resp), totalUsage, resp.Model, resp.StopReason, nil
+		}
+
+		// Cap reached on this round; no further dispatch is allowed.
+		if round == MaxToolRounds {
+			return "", totalUsage, resp.Model, resp.StopReason,
+				fmt.Errorf("runtime: tool-use cap reached (%d rounds) without final text", MaxToolRounds)
+		}
+
+		// Dispatch each local tool_use block, build tool_result blocks.
+		results := r.dispatchToolUseBlocks(ctx, agent.Name, toolUseBlocks, round)
+
+		// Extend the conversation: assistant's full response + our tool results.
+		messages = append(messages,
+			Message{Role: "assistant", Content: resp.Content},
+			Message{Role: "user", Content: results},
+		)
+	}
+
+	// Defensive: the cap return above should fire first; this branch only
+	// runs if MaxToolRounds is set to 0, which we don't permit.
+	return "", totalUsage, "", "", fmt.Errorf("runtime: tool dispatch loop exited unexpectedly")
+}
+
+// dispatchToolUseBlocks invokes every local tool_use block and returns the
+// matching tool_result blocks. Tool errors become tool_result blocks with
+// is_error=true so the model can adapt; no error from this function ever
+// propagates to the caller. Server-side tools requested as tool_use (a
+// programmer bug — Anthropic should never produce that combination) are
+// surfaced as is_error tool_results AND logged as ERROR.
+func (r *Runtime) dispatchToolUseBlocks(
+	ctx context.Context,
+	agentName string,
+	blocks []ContentBlock,
+	round int,
+) []ContentBlock {
+	out := make([]ContentBlock, 0, len(blocks))
+	for _, b := range blocks {
+		tool, ok := r.tools.LookupByAPIName(b.Name)
+		if !ok {
+			r.logger.Error("runtime: unknown tool requested by model",
+				"agent", agentName, "round", round, "tool_api_name", b.Name)
+			out = append(out, ToolResultBlock(b.ID,
+				fmt.Sprintf("error: tool %q is not registered", b.Name), true))
+			continue
+		}
+		if tool.IsServerSide() {
+			r.logger.Error("runtime: server-side tool emitted as tool_use",
+				"agent", agentName, "round", round, "tool", tool.Name())
+			out = append(out, ToolResultBlock(b.ID,
+				fmt.Sprintf("error: %q is a server-side tool and cannot be locally dispatched", tool.Name()), true))
+			continue
+		}
+		r.logger.Info("runtime: dispatching tool",
+			"agent", agentName, "round", round, "tool", tool.Name(),
+			"input_bytes", len(b.Input))
+		result, ierr := tool.Invoke(ctx, b.Input)
+		if ierr != nil {
+			r.logger.Info("runtime: tool error",
+				"agent", agentName, "round", round, "tool", tool.Name(), "error", ierr.Error())
+			out = append(out, ToolResultBlock(b.ID, ierr.Error(), true))
+			continue
+		}
+		out = append(out, ToolResultBlock(b.ID, string(result), false))
+	}
+	return out
+}
+
+// collectToolUseBlocks returns the tool_use blocks from a content list.
+// Order preserved so multiple tool_use blocks in one assistant turn dispatch
+// in the order the model emitted them.
+func collectToolUseBlocks(content []ContentBlock) []ContentBlock {
+	var out []ContentBlock
+	for _, b := range content {
+		if b.Type == "tool_use" {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // extractText concatenates the `text` content blocks of a response. v0
@@ -250,14 +402,22 @@ func appendRetryNote(systemBase, lastText, lastErrSummary string) string {
 		"Do not repeat the previous mistake."
 }
 
-// stripJSONFences trims surrounding markdown code fences that some models
-// add despite explicit instructions. Handles ```json...```, ```...```, and
-// stray leading/trailing whitespace. If the text isn't fence-wrapped, it's
-// returned unchanged.
+// stripJSONFences trims surrounding markdown code fences AND any leading/
+// trailing prose, returning the first balanced JSON object the response
+// contains. Handles three messy real-world cases:
+//
+//   - ```json {...} ``` — markdown-fenced
+//   - ``` {...} ```      — fence without language tag
+//   - "Now I'll provide the observation. {...}" — prose preamble (some
+//     models do this even after explicit "no prose" instructions)
+//
+// If no balanced object is found, returns the string with fences/whitespace
+// stripped — the JSON parser will then fail with a useful error.
 func stripJSONFences(s string) string {
 	t := strings.TrimSpace(s)
+
+	// Fence handling first.
 	if strings.HasPrefix(t, "```") {
-		// Drop the opening fence line.
 		if i := strings.Index(t, "\n"); i >= 0 {
 			t = t[i+1:]
 		} else {
@@ -267,7 +427,60 @@ func stripJSONFences(s string) string {
 	if strings.HasSuffix(t, "```") {
 		t = strings.TrimSuffix(t, "```")
 	}
-	return strings.TrimSpace(t)
+	t = strings.TrimSpace(t)
+
+	// If the text is already a valid object/array shape, return as-is.
+	if strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[") {
+		return t
+	}
+
+	// Scan for a balanced top-level JSON object embedded in prose.
+	if obj := extractFirstJSONObject(t); obj != "" {
+		return obj
+	}
+	return t
+}
+
+// extractFirstJSONObject walks s looking for the first balanced {...} block,
+// tracking string state and escape sequences so braces inside JSON strings
+// don't confuse the depth counter. Returns the matched substring (inclusive
+// of the outer braces) or "" if no balanced object is found.
+func extractFirstJSONObject(s string) string {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escape := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if c == '\\' && inString {
+			escape = true
+			continue
+		}
+		if c == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch c {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
 }
 
 // formatValidationErrors flattens registry errors into the bullet list used
@@ -305,9 +518,19 @@ func firstString(errs []types.ValidationError) string {
 // finishResult fills in the time-and-cost fields just before the result is
 // handed back to the caller. Mutates and returns r so the call site stays
 // terse.
+//
+// model is the identifier billing should use — pass result.Model (the form
+// the API echoed back, which may be the dated snapshot even when the
+// request used an alias). Falls back to a non-empty input if the response
+// hasn't populated Model yet (e.g. transport error before any successful
+// call).
 func finishResult(r *InvokeResult, model string, start time.Time) *InvokeResult {
 	r.LatencyMS = int(time.Since(start).Milliseconds())
-	r.CostUSD = billing.CostUSD(model, r.PromptTokens, r.CompletionTokens)
+	bill := model
+	if bill == "" {
+		bill = r.Model
+	}
+	r.CostUSD = billing.CostUSD(bill, r.PromptTokens, r.CompletionTokens)
 	return r
 }
 
