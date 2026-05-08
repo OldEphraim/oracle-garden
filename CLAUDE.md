@@ -290,19 +290,25 @@ One workflow seeded as `is_system = true`:
 
 ```
 [Market Watcher] ───┐
-                    ├──► [Thesis Builder] ──► [Risk Assessor] ──┬─[approved]──► [Paper Executor]
-[News Scout]    ───┘                                            │
-                                                                └─[rejected]──► [Thesis Builder]  (loop, max 5)
+                    ├──► [Thesis Builder] ──┬──► [Risk Assessor] ──┬─[approved]──► [Paper Executor]
+[News Scout]    ───┘                        │                      │                      ▲
+                                            │                      │                      │
+                                            └──────────────────────┼──────────────────────┘
+                                                                   │
+                                                                   └─[rejected]──► [Thesis Builder]
+                                                                                      (loop, max 5)
 ```
 
 - Watcher → Thesis: `condition = always`, `priority = 0`.
 - Scout → Thesis: `condition = always`, `priority = 0`.
 - Thesis Builder: `join_strategy = all`, `loop_iteration_limit = 5`.
-- Thesis → Risk: `condition = always`.
+- Thesis → Risk: `condition = always`, `priority = 0`.
+- Thesis → Executor: `condition = always`, `priority = 1`. Supplies `thesis.v1` so the Executor can resolve `market_slug` and `direction`.
 - Risk → Executor: `condition = approved`, `priority = 0`.
 - Risk → Thesis (loop back): `condition = rejected`, `priority = 1`.
+- Paper Executor: `join_strategy = all`. Gating is preserved: the Risk approved edge is what activates the path; the Thesis edge ensures `thesis.v1` is in the merged input. With `join_strategy = all`, the Executor only fires when both upstreams have produced output.
 
-This template exercises every engine feature: branching (Risk → Executor vs Thesis), loops (Risk rejection back to Thesis), fan-in (Watcher + Scout → Thesis with all-join). Fan-out is not used in this template but is supported.
+This template exercises every engine feature: branching (Risk → Executor vs Thesis), loops (Risk rejection back to Thesis), fan-in (Watcher + Scout → Thesis with all-join, and Thesis + Risk → Executor with all-join). Fan-out is not used in this template but is supported.
 
 The user's demo customization — adding a "Devil's Advocate" agent — slots in by forking this workflow, removing the existing Thesis → Risk edge, and adding three new edges (Thesis → DA, Scout → DA, DA → Risk):
 

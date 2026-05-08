@@ -118,15 +118,21 @@ type ContentBlock struct {
 	// type=text
 	Text string `json:"text,omitempty"`
 
-	// type=tool_use (assistant emits these)
+	// type=tool_use (assistant emits these) AND type=server_tool_use
+	// (Anthropic emits these for built-in tools like web_search)
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
 
-	// type=tool_result (we send these back to the model)
-	ToolUseID  string `json:"tool_use_id,omitempty"`
-	ResultText string `json:"content,omitempty"` // wire field is `content`
-	IsError    bool   `json:"is_error,omitempty"`
+	// type=tool_result (we send these back to the model). Anthropic also
+	// emits server-side tool_result variants like `web_search_tool_result`
+	// that share this field. The wire payload may be a string (our local-
+	// tool case) or an array of content blocks (web_search_tool_result),
+	// so we model it as a raw JSON message — the runtime's text extractor
+	// ignores these block types entirely.
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
 }
 
 // TextBlock is a constructor for the common single-text-block case.
@@ -136,13 +142,16 @@ func TextBlock(s string) ContentBlock {
 
 // ToolResultBlock builds the user-side reply to an assistant's tool_use
 // block. resultText should be the JSON-stringified output (or an error
-// message when isError is true).
+// message when isError is true). We JSON-encode it here so it serializes
+// as a string in the wire `content` field (Anthropic accepts both string
+// and array forms; we always send the string form for local-tool results).
 func ToolResultBlock(toolUseID, resultText string, isError bool) ContentBlock {
+	encoded, _ := json.Marshal(resultText)
 	return ContentBlock{
-		Type:       "tool_result",
-		ToolUseID:  toolUseID,
-		ResultText: resultText,
-		IsError:    isError,
+		Type:      "tool_result",
+		ToolUseID: toolUseID,
+		Content:   encoded,
+		IsError:   isError,
 	}
 }
 

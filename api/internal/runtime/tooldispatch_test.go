@@ -356,8 +356,8 @@ func TestToolErrorBecomesIsErrorResult(t *testing.T) {
 	if !tr.IsError {
 		t.Errorf("is_error should be true on tool failure")
 	}
-	if !strings.Contains(tr.ResultText, "503") {
-		t.Errorf("result text should carry the error: %q", tr.ResultText)
+	if !strings.Contains(string(tr.Content), "503") {
+		t.Errorf("result content should carry the error: %q", string(tr.Content))
 	}
 }
 

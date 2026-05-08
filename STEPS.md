@@ -231,7 +231,7 @@ After each phase, append an entry to `DECISION_LOG.md` summarizing decisions mad
 - `api/internal/api/handlers/me.go` — current user, usage.
 - `api/internal/api/handlers/admin.go` — env-gated admin routes.
 - `api/internal/api/handlers/types.go` — list types, get schema.
-- `api/internal/sse/broadcaster.go` — per-run SSE channel with **replay buffer**: a ring buffer of all events since `RunStarted`, flushed to each new subscriber before live events stream. Engine fires its first agent step immediately — no startup delay.
+- `api/internal/sse/broadcaster.go` — per-run SSE channel with **replay buffer**: a ring buffer of all events since `RunStarted`, flushed to each new subscriber before live events stream. Engine fires its first agent step immediately — no startup delay. Buffer is capped at 500 events per run; on overflow, the oldest events are dropped and a `BufferTruncated` event is emitted into the stream so clients know they've missed history. The 50-step run cap × ~10 events per step gives a normal run a comfortable safety margin under 500.
 - `api/internal/auth/middleware.go` — JWT cookie validation using `golang-jwt/jwt/v5` with HS256 + `NEXTAUTH_SECRET`. Attaches `user_id` to request context.
 
 **Verification:**
@@ -373,7 +373,7 @@ After each phase, append an entry to `DECISION_LOG.md` summarizing decisions mad
 - `api/seed/agents/03_thesis_builder.json` — per AGENT_TEMPLATES.md; input_types `['observation.v1','news_digest.v1','risk_assessment.v1']`, no tools, system prompt explicitly handles the optional `risk` input.
 - `api/seed/agents/04_risk_assessor.json` — per AGENT_TEMPLATES.md, no tools.
 - `api/seed/agents/05_paper_executor.json` — per AGENT_TEMPLATES.md, tools `[polymarket.gamma_get_market, polymarket.clob_get_orderbook]`. System prompt explicitly instructs resolving token_ids via gamma_get_market.
-- `api/seed/workflows/happy_path.json` — workflow + 5 nodes + 5 edges (Watcher→Thesis, Scout→Thesis, Thesis→Risk, Risk→Executor `approved`, Risk→Thesis `rejected`).
+- `api/seed/workflows/happy_path.json` — workflow + 5 nodes + 6 edges (Watcher→Thesis, Scout→Thesis, Thesis→Risk, Thesis→Executor `always`, Risk→Executor `approved`, Risk→Thesis `rejected`).
 - `Makefile` — `seed` target.
 
 **Verification:**
