@@ -29,6 +29,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/OldEphraim/sibyl-hub/api/internal/billing"
 	"github.com/OldEphraim/sibyl-hub/api/internal/db/repos"
 	"github.com/OldEphraim/sibyl-hub/api/internal/engine"
 	"github.com/OldEphraim/sibyl-hub/api/internal/polymarket"
@@ -40,6 +41,9 @@ import (
 func main() {
 	slug := flag.String("slug", "", "Polymarket market slug (required)")
 	verbose := flag.Bool("v", false, "DEBUG logs (Anthropic latency, tool dispatch)")
+	userEmail := flag.String("user-email", "",
+		"reuse a stable user across invocations (created if missing). Default: ephemeral user per run.")
+	repeat := flag.Int("repeat", 1, "number of runs to execute back-to-back; useful for quota smoke tests")
 	flag.Parse()
 
 	if *slug == "" {
@@ -65,10 +69,16 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 11*time.Minute)
-	defer cancel()
+	if *repeat < 1 {
+		*repeat = 1
+	}
+	// Per-repeat upper bound — give each invocation up to ~12 minutes
+	// (engine cap is 10, plus slack). Run loop walks repeats sequentially.
+	ctx := context.Background()
 
-	pool, err := pgxpool.New(ctx, dsn)
+	dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
+	pool, err := pgxpool.New(dbCtx, dsn)
+	dbCancel()
 	if err != nil {
 		fail("pool", err)
 	}
@@ -98,37 +108,88 @@ func main() {
 	paperRepo := repos.NewPaperTradesRepo()
 	configRepo := repos.NewSystemConfigRepo()
 
-	// Bootstrap an ephemeral user + agents + workflow. Phase 14 will replace
-	// this with `make seed`; for now we insert directly so each runctl run
-	// is self-contained.
-	user, err := usersRepo.Create(ctx, pool, repos.CreateUserParams{
-		Email:        fmt.Sprintf("runctl-%s@example.com", uuid.New().String()),
-		PasswordHash: "$2a$10$ignored",
-	})
-	if err != nil {
-		fail("create user", err)
-	}
+	// User: reuse if --user-email matches an existing row, otherwise create.
+	// Stable users are necessary for the --repeat quota smoke test; fresh
+	// users would each get their own daily-cap track and never trip.
+	user := mustResolveUser(ctx, pool, usersRepo, *userEmail)
 
 	wfID, err := bootstrapHappyPathWorkflow(ctx, pool, agentsRepo, workflowsRepo, user.ID)
 	if err != nil {
 		fail("bootstrap workflow", err)
 	}
 
-	executor := engine.NewExecutor(pool, rt, workflowsRepo, agentsRepo, runsRepo, paperRepo, configRepo,
-		engine.Options{Logger: logger})
+	quotas := billing.NewQuotas(repos.NewUsageRepo())
+	logger.Info("runctl: quota caps loaded",
+		"user", user.Email,
+		"max_runs_per_day", quotas.MaxRunsPerDay,
+		"max_cost_usd_per_day", quotas.MaxCostUSDPerDay)
 
-	fmt.Printf("==> Running happy-path workflow against slug %q\n", *slug)
-	res, err := executor.Run(ctx, engine.RunRequest{
-		WorkflowID:  wfID,
-		UserID:      user.ID,
-		MarketSlug:  *slug,
-		TriggeredBy: "manual",
+	executor := engine.NewExecutor(pool, rt, workflowsRepo, agentsRepo, runsRepo, paperRepo, configRepo,
+		quotas, engine.Options{Logger: logger})
+
+	for i := 1; i <= *repeat; i++ {
+		fmt.Printf("\n==================== Run %d/%d ====================\n", i, *repeat)
+
+		// Pre-flight quota check — surface the reason to stderr but
+		// continue iterating so subsequent reps can show the same outcome
+		// (helpful when verifying "first 2 succeed, last 3 quota_exceeded").
+		preCtx, preCancel := context.WithTimeout(ctx, 5*time.Second)
+		ok, reason, qErr := quotas.CheckQuota(preCtx, pool, user.ID)
+		preCancel()
+		if qErr != nil {
+			fmt.Fprintln(os.Stderr, "runctl: quota check failed:", qErr)
+			os.Exit(1)
+		}
+		if !ok {
+			fmt.Printf("==> Pre-flight quota check: SKIP (%s)\n", reason)
+			continue
+		}
+
+		runCtx, runCancel := context.WithTimeout(ctx, 12*time.Minute)
+		fmt.Printf("==> Running happy-path workflow against slug %q\n", *slug)
+		res, err := executor.Run(runCtx, engine.RunRequest{
+			WorkflowID:  wfID,
+			UserID:      user.ID,
+			MarketSlug:  *slug,
+			TriggeredBy: "manual",
+		})
+		runCancel()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "runctl: Run error:", err)
+			if res != nil {
+				printResult(res)
+			}
+			os.Exit(1)
+		}
+		printResult(res)
+	}
+}
+
+// mustResolveUser returns a user matching --user-email, creating one if no
+// row exists. Empty --user-email falls back to a fresh ephemeral user
+// (legacy behavior for callers that don't care about quota persistence).
+func mustResolveUser(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	usersRepo *repos.UsersRepo,
+	email string,
+) *repos.User {
+	if email == "" {
+		email = fmt.Sprintf("runctl-%s@example.com", uuid.New().String())
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if existing, err := usersRepo.GetByEmail(dbCtx, pool, email); err == nil {
+		return existing
+	}
+	created, err := usersRepo.Create(dbCtx, pool, repos.CreateUserParams{
+		Email:        email,
+		PasswordHash: "$2a$10$ignored",
 	})
 	if err != nil {
-		fail("Run", err)
+		fail("resolve user", err)
 	}
-
-	printResult(res)
+	return created
 }
 
 func bootstrapHappyPathWorkflow(

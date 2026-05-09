@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/OldEphraim/sibyl-hub/api/internal/billing"
 	"github.com/OldEphraim/sibyl-hub/api/internal/db/repos"
 	"github.com/OldEphraim/sibyl-hub/api/internal/runtime"
 	"github.com/OldEphraim/sibyl-hub/api/internal/types"
@@ -262,7 +263,9 @@ func makeExecutor(f *fixtures, mock *mockInvoker, opts Options) *Executor {
 	if opts.Logger == nil {
 		opts.Logger = quietLogger()
 	}
-	return NewExecutor(f.tx, mock, f.workflowsRepo, f.agentsRepo, f.runsRepo, f.paperRepo, f.configRepo, opts)
+	// nil quotas — Phase 6 tests don't exercise the cost-cap path; Phase 7
+	// has its own quota tests that pass a real *billing.Quotas with low caps.
+	return NewExecutor(f.tx, mock, f.workflowsRepo, f.agentsRepo, f.runsRepo, f.paperRepo, f.configRepo, nil, opts)
 }
 
 // validObservation returns a payload that conforms to observation.v1.
@@ -874,6 +877,121 @@ func TestStepFailureTerminatesRun(t *testing.T) {
 			t.Errorf("step: got %+v want failed", res.Steps)
 		}
 	})
+}
+
+// TestQuotaRunCountExceededAtRunStart: when the run-count cap is already
+// reached, the engine increments past it and finalizes the row immediately
+// as 'quota_exceeded' without firing a single agent step.
+func TestQuotaRunCountExceededAtRunStart(t *testing.T) {
+	withTx(t, func(t *testing.T, f *fixtures) {
+		a := f.agentTemplate(t, "A", "trading_decision.v1", []string{"market_target.v1"})
+		wf, _ := f.workflowAndNodes(t, []nodeSpec{{key: "a", agentID: a.ID}})
+
+		mock := newMockInvoker()
+		// Pre-fill the user's run_count to the cap so IncrementRunCount goes over.
+		usageRepo := repos.NewUsageRepo()
+		for i := 0; i < 2; i++ {
+			if _, err := usageRepo.IncrementRun(f.ctx, f.tx, f.userID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		quotas := billing.NewQuotas(usageRepo)
+		quotas.MaxRunsPerDay = 2 // already at cap
+
+		ex := NewExecutor(f.tx, mock, f.workflowsRepo, f.agentsRepo, f.runsRepo,
+			f.paperRepo, f.configRepo, quotas,
+			Options{Logger: quietLogger()})
+		res, err := ex.Run(f.ctx, RunRequest{
+			WorkflowID: wf, UserID: f.userID, MarketSlug: "x", TriggeredBy: "manual",
+		})
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Run.Status != "quota_exceeded" {
+			t.Errorf("status: got %q want quota_exceeded", res.Run.Status)
+		}
+		if len(res.Steps) != 0 {
+			t.Errorf("expected 0 steps fired, got %d", len(res.Steps))
+		}
+	})
+}
+
+// TestQuotaCostCapExceededMidRun: cost cap is crossed during step #2, so
+// step #3 doesn't fire and the run is marked quota_exceeded.
+func TestQuotaCostCapExceededMidRun(t *testing.T) {
+	withTx(t, func(t *testing.T, f *fixtures) {
+		a := f.agentTemplate(t, "A", "observation.v1", []string{"market_target.v1"})
+		b := f.agentTemplate(t, "B", "thesis.v1", []string{"observation.v1"})
+		c := f.agentTemplate(t, "C", "trading_decision.v1", []string{"thesis.v1"})
+
+		wf, ids := f.workflowAndNodes(t, []nodeSpec{
+			{key: "a", agentID: a.ID},
+			{key: "b", agentID: b.ID},
+			{key: "c", agentID: c.ID},
+		})
+		f.edge(t, wf, ids["a"], ids["b"], "always", 0)
+		f.edge(t, wf, ids["b"], ids["c"], "always", 0)
+
+		// Each step "costs" $0.04 in the mock — totals 0.04, 0.08, 0.12.
+		// Cap of $0.10 is crossed by the second step's 0.08… still below.
+		// Crossed by the third step's 0.12 — but the engine checks AFTER
+		// each step finalization, so step 3 should NOT fire because the
+		// check happens at the end of step 2 (total 0.08 < cap 0.10),
+		// then step 2's edge fires and step 3 is queued. Then at step 3
+		// completion, total goes to 0.12 > 0.10 and the loop terminates.
+		// To get a deterministic check-mid-run, we set cap=0.06 — step 1
+		// alone (0.04) is under, step 2 brings total to 0.08 > 0.06 →
+		// quota_exceeded after step 2; step 3 never fires.
+		quotas := billing.NewQuotas(repos.NewUsageRepo())
+		quotas.MaxRunsPerDay = 100 // not testing run cap here
+		quotas.MaxCostUSDPerDay = 0.06
+
+		mock := newMockInvoker()
+		mockCost := func(out json.RawMessage) invocationResult {
+			return invocationResult{output: out}
+		}
+		mock.queue("a", mockCost(validObservation("x")))
+		mock.queue("b", mockCost(validThesis("x", "YES", 0.5)))
+		mock.queue("c", mockCost(validTradingDecision("x", "YES", 10, 0.5)))
+
+		// Patch mockInvoker to report a fixed $0.04 per call.
+		ex := NewExecutor(f.tx, &costingMock{base: mock, cost: 0.04, tokens: 100},
+			f.workflowsRepo, f.agentsRepo, f.runsRepo, f.paperRepo, f.configRepo,
+			quotas, Options{Logger: quietLogger()})
+		res, err := ex.Run(f.ctx, RunRequest{
+			WorkflowID: wf, UserID: f.userID, MarketSlug: "x", TriggeredBy: "manual",
+		})
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Run.Status != "quota_exceeded" {
+			t.Errorf("status: got %q want quota_exceeded", res.Run.Status)
+		}
+		if len(res.Steps) != 2 {
+			t.Errorf("steps: got %d want 2 (step 3 should not fire)", len(res.Steps))
+		}
+		if res.Run.ErrorMessage == nil || !strings.Contains(*res.Run.ErrorMessage, "cost cap") {
+			t.Errorf("error_message: %v", res.Run.ErrorMessage)
+		}
+	})
+}
+
+// costingMock wraps mockInvoker, overriding the cost/tokens fields on every
+// returned InvokeResult so the cost-cap test gets predictable totals.
+type costingMock struct {
+	base   *mockInvoker
+	cost   float64
+	tokens int
+}
+
+func (c *costingMock) Invoke(ctx context.Context, agent runtime.Agent, in map[string]json.RawMessage) (*runtime.InvokeResult, error) {
+	res, err := c.base.Invoke(ctx, agent, in)
+	if res != nil {
+		res.CostUSD = c.cost
+		res.PromptTokens = c.tokens
+		res.CompletionTokens = 0
+	}
+	return res, err
 }
 
 // TestAbstainTerminalProducesAbstainedRow: side=ABSTAIN → status='abstained'.

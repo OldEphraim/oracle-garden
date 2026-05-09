@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/OldEphraim/sibyl-hub/api/internal/billing"
 	"github.com/OldEphraim/sibyl-hub/api/internal/db"
 	"github.com/OldEphraim/sibyl-hub/api/internal/db/repos"
 	"github.com/OldEphraim/sibyl-hub/api/internal/runtime"
@@ -35,6 +36,7 @@ type Executor struct {
 	runsRepo      *repos.RunsRepo
 	paperRepo     *repos.PaperTradesRepo
 	configRepo    *repos.SystemConfigRepo
+	quotas        *billing.Quotas // Phase 7 — nil disables quota enforcement (test path)
 	logger        *slog.Logger
 
 	// Caps — Options can override for tests.
@@ -58,7 +60,9 @@ type Options struct {
 }
 
 // NewExecutor builds an Executor. invoker may NOT be nil — the engine has
-// no work to do without an agent runtime.
+// no work to do without an agent runtime. quotas may be nil for test paths
+// that don't want to exercise the cost-cap machinery; production wiring
+// always supplies one (see runctl).
 func NewExecutor(
 	q db.Querier,
 	invoker AgentInvoker,
@@ -67,6 +71,7 @@ func NewExecutor(
 	runsRepo *repos.RunsRepo,
 	paperRepo *repos.PaperTradesRepo,
 	configRepo *repos.SystemConfigRepo,
+	quotas *billing.Quotas,
 	opts Options,
 ) *Executor {
 	if invoker == nil {
@@ -86,6 +91,7 @@ func NewExecutor(
 		runsRepo:       runsRepo,
 		paperRepo:      paperRepo,
 		configRepo:     configRepo,
+		quotas:         quotas,
 		logger:         opts.Logger,
 		perStepTimeout: opts.PerStepTimeout,
 		perRunTimeout:  opts.PerRunTimeout,
@@ -160,6 +166,25 @@ func (e *Executor) Run(ctx context.Context, req RunRequest) (*RunResult, error) 
 	e.logger.Info("engine: run started",
 		"run_id", run.ID, "workflow_id", req.WorkflowID,
 		"market_slug", req.MarketSlug, "entry_nodes", len(graph.EntryNodes))
+
+	// Atomic run-count increment — CLAUDE.md "Cost Protection" mechanism #1.
+	// Two concurrent runs by the same user can't both pass the pre-check
+	// and overshoot the cap because the second INSERT serializes against
+	// the first via the unique (user_id, day) index.
+	if e.quotas != nil {
+		newCount, ierr := e.quotas.IncrementRunCount(ctx, e.db, req.UserID)
+		if ierr != nil {
+			_ = e.finalizeRunStatus(ctx, run.ID, "failed", ierr.Error(), true)
+			return nil, fmt.Errorf("engine: Run: increment run_count: %w", ierr)
+		}
+		if e.quotas.IsOverRunCount(newCount) {
+			msg := fmt.Sprintf("daily run quota exceeded (%d), this run is #%d", e.quotas.MaxRunsPerDay, newCount)
+			_ = e.finalizeRunStatus(ctx, run.ID, "quota_exceeded", msg, true)
+			run.Status = "quota_exceeded"
+			run.ErrorMessage = &msg
+			return &RunResult{Run: *run}, nil
+		}
+	}
 
 	// ----- Seed entry nodes and prime the ready queue ---------------------
 	seed, err := seedEntryInputs(req.MarketSlug, req.UserIntent)
@@ -320,6 +345,28 @@ func (e *Executor) Run(ctx context.Context, req RunRequest) (*RunResult, error) 
 		stepRow.LatencyMs = latencyMS
 		stepRow.ErrorMessage = finalErr
 		steps = append(steps, *stepRow)
+
+		// Atomic cost increment — CLAUDE.md "Cost Protection" mechanism #10.
+		// Done sequentially after UpdateStepCompleted (rather than in the
+		// same transaction). The agent_steps row already captures cost data,
+		// so a failed RecordStepCost is recoverable in v1+ via reconciliation.
+		// Marked as a Phase 8 cleanup in DECISION_LOG.
+		if e.quotas != nil && stepResult != nil && (stepResult.PromptTokens > 0 || stepResult.CompletionTokens > 0) {
+			tokens := int64(stepResult.PromptTokens + stepResult.CompletionTokens)
+			newTotal, rerr := e.quotas.RecordStepCost(ctx, e.db, req.UserID, stepResult.CostUSD, tokens)
+			if rerr != nil {
+				// Log but don't fail the run — the agent_steps row has the
+				// cost data, so reconciliation is possible later.
+				e.logger.Error("engine: record step cost failed (run continues)",
+					"run_id", run.ID, "step_id", stepRow.ID, "error", rerr)
+			} else if e.quotas.IsOverCostUSD(newTotal) {
+				terminalStatus = "quota_exceeded"
+				terminalErrMsg = fmt.Sprintf(
+					"daily cost cap exceeded ($%.2f), current $%.4f",
+					e.quotas.MaxCostUSDPerDay, newTotal)
+				break
+			}
+		}
 
 		// Step error → terminate the run.
 		if stepErr != nil {
